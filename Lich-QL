@@ -102,10 +102,15 @@
   // ───────────────────────────────────────────────────────────────────────────
   // ТИПЫ УРОНА / ХИЛ / ВХ
   // ───────────────────────────────────────────────────────────────────────────
-  const TYPE_MAP = {
-    'колющий'              : /колющ|piercing/,
-    'рубящий'              : /рубящ|slashing/,
-    'дробящий'             : /дробящ|bludgeoning/,
+  const DAMAGE_TYPE_MAP = {
+    'физический': {
+      _re: /физическ|physical/,
+      _children: {
+        'колющий' : /колющ|piercing/,
+        'рубящий' : /рубящ|slashing/,
+        'дробящий': /дробящ|bludgeoning/
+      }
+    },
     'кислота'              : /кислот|acid/,
     'холод'                : /холод|лед|cold/,
     'огонь'                : /огн|fire/,
@@ -121,6 +126,28 @@
     'лечение'              : /(леч(ени|ит)|healing|heal)/i,
     'весь'                 : /все|весь|любой/
   };
+
+  function flattenTypeMap(tree, parent=null, out={}){
+    Object.entries(tree).forEach(([name, spec])=>{
+      if (spec instanceof RegExp){
+        out[name] = { re: spec, parent, children: [] };
+        return;
+      }
+      const re = spec && spec._re instanceof RegExp ? spec._re : null;
+      out[name] = { re, parent, children: [] };
+      const kids = spec && spec._children ? spec._children : {};
+      flattenTypeMap(kids, name, out);
+    });
+    return out;
+  }
+
+  const TYPE_META = flattenTypeMap(DAMAGE_TYPE_MAP);
+  Object.entries(TYPE_META).forEach(([name, meta])=>{
+    if (meta.parent && TYPE_META[meta.parent]) TYPE_META[meta.parent].children.push(name);
+  });
+  const TYPE_MAP = Object.fromEntries(Object.entries(TYPE_META)
+    .filter(([,meta])=>meta.re instanceof RegExp)
+    .map(([name,meta])=>[name, meta.re]));
 
   // ───────────────────────────────────────────────────────────────────────────
   // УТИЛИТЫ
@@ -162,24 +189,93 @@
     return findObjs({ _pageid:pageId, type:'graphic', subtype:'token', represents:char.id })[0] || null;
   }
 
+  function parseDamageSpec(raw){
+    const src = String(raw||'').trim().toLowerCase();
+    if (!src) return { type:'без_типа', flags:[] };
+
+    const flags = new Set();
+    let base = src;
+
+    base = base.replace(/\[([^\]]+)]|\(([^)]+)\)/g, (_, a, b)=>{
+      String(a||b||'').split(/[,;|]/).map(x=>x.trim()).filter(Boolean).forEach(f=>flags.add(f));
+      return ' ';
+    });
+
+    base = base.replace(/\bнемагическ[а-яё]*\b/gi, (m)=>{ flags.add('немагический'); return ' '; });
+    base = base.replace(/\bмагическ[а-яё]*\b/gi, (m)=>{ flags.add('магический'); return ' '; });
+
+    const type = normalizeType(base.replace(/\s+/g,' ').trim() || 'без_типа');
+    return { type, flags:[...flags] };
+  }
+  function makeDamageKey(type, flags){
+    const arr = [...new Set((flags||[]).map(f=>String(f).trim().toLowerCase()).filter(Boolean))].sort();
+    return arr.length ? `${type} [${arr.join('|')}]` : type;
+  }
+  function parseDamageKey(key){
+    const m = String(key||'').match(/^(.*?)(?:\s*\[([^\]]+)\])?$/);
+    const type = normalizeType((m && m[1]) ? m[1] : key);
+    const flags = (m && m[2]) ? m[2].split('|').map(x=>x.trim()).filter(Boolean) : [];
+    return { type, flags };
+  }
   function parseDamageString(str){
-    const base = {}, re = /(\d+)\s+([^\+]+)/g; let m;
+    const out = [];
+    const re = /(\d+)\s+([^\+]+)/g; let m;
     while((m = re.exec(str)) !== null){
-      const t = m[2].trim();
-      base[t] = (base[t]||0) + Number(m[1]);
+      const amount = Number(m[1]) || 0;
+      if (!amount) continue;
+      const spec = parseDamageSpec(m[2]);
+      out.push({ amount, type: spec.type, flags: spec.flags, raw: m[2].trim() });
     }
-    return base;
+    return out;
   }
 
-  const totalsToString = (t)=>
-    Object.entries(t).filter(([,n])=>n)
-      .map(([ty,n])=> ty==='без_типа'?`${n}`:`${n} ${ty}`)
+  const totalsToString = (totals)=>
+    Object.entries(totals).filter(([,n])=>n)
+      .map(([key,n])=>{
+        const spec = parseDamageKey(key);
+        const label = makeDamageKey(spec.type, spec.flags);
+        return label==='без_типа'?`${n}`:`${n} ${label}`;
+      })
       .join(' + ') || '0';
 
   function normalizeType(raw){
     const s = String(raw).trim().toLowerCase();
     for (const [type, re] of Object.entries(TYPE_MAP)) if (re.test(s)) return type;
     return s || 'без_типа';
+  }
+  function getTypeFamily(typeName){
+    const out = new Set();
+    let cur = typeName;
+    while (cur && TYPE_META[cur] && !out.has(cur)){
+      out.add(cur);
+      cur = TYPE_META[cur].parent;
+    }
+    if (!out.size) out.add(typeName || 'без_типа');
+    return out;
+  }
+  function matchesDefenseType(damageType, defenseType){
+    if (!defenseType) return false;
+    if (defenseType === 'весь') return true;
+    if (damageType === defenseType) return true;
+    return getTypeFamily(damageType).has(defenseType);
+  }
+  function hasAllFlags(need, has){
+    const pool = new Set((has||[]).map(x=>String(x).toLowerCase()));
+    return (need||[]).every(f=>pool.has(String(f).toLowerCase()));
+  }
+  function matchesDefenseSpec(damageSpec, defenseSpec){
+    if (!defenseSpec) return false;
+    if (!matchesDefenseType(damageSpec.type, defenseSpec.type)) return false;
+    return hasAllFlags(defenseSpec.flags, damageSpec.flags);
+  }
+  function findTypedValue(entries, damageSpec){
+    let best = null;
+    (entries||[]).forEach(it=>{
+      if (!matchesDefenseSpec(damageSpec, it)) return;
+      const score = (it.flags||[]).length * 100 + (it.type === damageSpec.type ? 10 : 0);
+      if (!best || score > best.score) best = { ...it, score };
+    });
+    return best;
   }
   function resolveWeaponTypeAlias(rawType, w1, w2){
     const txt = String(rawType||'').trim().toLowerCase();
@@ -196,9 +292,21 @@
   function parseMap(s){
     const out={};
     String(s||'').split(',').map(x=>x.trim()).forEach(it=>{
-      const r = it.match(/^(.+?)\s+(\d+)$/);
+      const r = it.match(/^(.+?)\s+(-?\d+)$/);
       if (r) out[r[1].trim()] = Number(r[2]);
     });
+    return out;
+  }
+  function parseDefenseSpec(raw){
+    const spec = parseDamageSpec(raw);
+    return { type: spec.type, flags: spec.flags };
+  }
+  function parseDefenseList(s){
+    return parseList(s).map(parseDefenseSpec);
+  }
+  function parseDefenseMap(s){
+    const out = [];
+    Object.entries(parseMap(s)).forEach(([k,v])=> out.push({ ...parseDefenseSpec(k), value:v }));
     return out;
   }
   function getAttr(char,name){
@@ -288,31 +396,33 @@
           v  = getAttr(char,'npc_vulnerabilities'),
           th = Number(getAttr(char,'damage_threshold'))||0;
 
-    const res = parseList(r).map(normalizeType),
-          imm = parseList(i).map(normalizeType),
-          abs = Object.fromEntries(Object.entries(parseMap(a)).map(([k,v])=>[normalizeType(k),v])),
-          vm  = Object.fromEntries(Object.entries(parseMap(v)).map(([k,v])=>[normalizeType(k),v])),
-          vl  = parseList(v).map(normalizeType).filter(t=>!(t in vm));
+    const res = parseDefenseList(r),
+          imm = parseDefenseList(i),
+          abs = parseDefenseMap(a),
+          vm  = parseDefenseMap(v),
+          vmKeys = new Set(vm.map(x=>makeDamageKey(x.type, x.flags))),
+          vl  = parseDefenseList(v).filter(x=>!vmKeys.has(makeDamageKey(x.type, x.flags)));
 
     return {res,imm,abs,vulnMap:vm,vulnList:vl,threshold:th};
   }
   function getPCDefense(char){
     const raw = getAttr(char,'personality_traits');
     const lines = String(raw||'').split(/\r?\n/).map(l=>l.trim()).filter(Boolean).slice(0,5);
-    const res=[],imm=[],abs={},vulnMap={},vulnList=[]; let threshold=0;
+    const res=[],imm=[],abs=[],vulnMap=[],vulnList=[]; let threshold=0;
     lines.forEach(l=>{
       const m = l.match(/^([^:]+):\s*(.+)$/); if(!m) return;
       const key = m[1].toLowerCase(), val = m[2];
-      if (key.includes('сопротивлен'))  parseList(val).forEach(t=>res.push(normalizeType(t)));
-      else if (key.includes('иммунитет'))parseList(val).forEach(t=>imm.push(normalizeType(t)));
-      else if (key.includes('поглощ'))   Object.assign(abs, Object.fromEntries(Object.entries(parseMap(val)).map(([k,v])=>[normalizeType(k),v])));
-      else if (key.includes('слабость')) Object.assign(vulnMap, Object.fromEntries(Object.entries(parseMap(val)).map(([k,v])=>[normalizeType(k),v])));
-      else if (key.includes('уязвим')) { parseList(val).forEach(t=>vulnList.push(normalizeType(t)));
-                                         Object.assign(vulnMap, Object.fromEntries(Object.entries(parseMap(val)).map(([k,v])=>[normalizeType(k),v]))); }
+      if (key.includes('сопротивлен'))  parseDefenseList(val).forEach(t=>res.push(t));
+      else if (key.includes('иммунитет'))parseDefenseList(val).forEach(t=>imm.push(t));
+      else if (key.includes('поглощ'))   parseDefenseMap(val).forEach(t=>abs.push(t));
+      else if (key.includes('слабость')) parseDefenseMap(val).forEach(t=>vulnMap.push(t));
+      else if (key.includes('уязвим')) { parseDefenseList(val).forEach(t=>vulnList.push(t));
+                                         parseDefenseMap(val).forEach(t=>vulnMap.push(t)); }
       else if (key.includes('порог'))    threshold = Number(val)||threshold;
     });
     return {res,imm,abs,vulnMap,vulnList,threshold};
   }
+
 
   // ── статусы из текста описания (markdown links)
   function extractStatuses(description){
@@ -490,6 +600,22 @@
     return segs;
   }
 
+  function extractDamageFlagsFromDescription(content){
+    const m = String(content||'').match(/{{desc(?:ription)?=(.+?)}}/is);
+    if (!m) return [];
+    const plain = m[1]
+      .replace(/<br\s*\/?>/gi, ',')
+      .replace(/<[^>]*>/g, ' ')
+      .toLowerCase();
+    const flags = new Set();
+    plain.split(/[,;\.]/).map(x=>x.trim()).filter(Boolean).forEach(tok=>{
+      if (/немагическ/.test(tok)) flags.add('немагический');
+      else if (/магическ/.test(tok)) flags.add('магический');
+      else if (tok.length <= 32) flags.add(tok);
+    });
+    return [...flags];
+  }
+
   // ── вытаскивание из rolltemplate полей (dmg1/dmg2/global*)
   function computeTotals(msg, fields, globals, typeKey){
     const kv={};
@@ -498,19 +624,22 @@
     });
     const w1=normalizeType((kv['dmg1type']||'без_типа').trim());
     const w2=normalizeType((kv['dmg2type']||'без_типа').trim());
+    const commonFlags = extractDamageFlagsFromDescription(msg.content);
 
     const totals={};
-    const add=(rawType,val)=>{
+    const add=(rawType,val,extraFlags=[])=>{
       if (!val) return;
-      const t=normalizeType(rawType||'без_типа');
-      totals[t]=(totals[t]||0)+val;
+      const resolved = resolveWeaponTypeAlias(rawType||'без_типа', w1, w2);
+      const spec = parseDamageSpec(resolved);
+      const key = makeDamageKey(spec.type, spec.flags.concat(commonFlags, extraFlags));
+      totals[key]=(totals[key]||0)+val;
     };
 
     fields.forEach(({fld,tFld})=>{
       const idx = kv[fld]?.match(/\[\[(\d+)]]/)?.[1];
       const v   = rollTotal(idx,msg); if (!v) return;
       const raw = (kv[tFld]||'без_типа').trim()||'без_типа';
-      add(resolveWeaponTypeAlias(raw,w1,w2), v);
+      add(raw, v);
     });
 
     globals.forEach(fld=>{
@@ -522,7 +651,7 @@
       const types = (kv[typeKey||'globaldamagetype']||'').split('/').map(s=>s.trim());
       parts.forEach((p,i)=>{
         const raw = types[i]||'без_типа';
-        add(resolveWeaponTypeAlias(raw,w1,w2), p.val);
+        add(raw, p.val);
       });
     });
 
@@ -704,11 +833,7 @@
       }
       if (!msg.selected?.length){ sendChat('DM-Scan', `/w "${msg.who}" ${box('Не удалось определить цель')}`); return; }
 
-      const base = parseDamageString(str);
-      const baseEntries = Object.entries(base);
-      let maxIdx=0, maxDmg=-Infinity;
-      baseEntries.forEach(([_,v],i)=>{ if (v>maxDmg){ maxDmg=v; maxIdx=i; } });
-
+      const baseEntries = parseDamageString(str);
       msg.selected.forEach(sel=>{
         const tok  = getObj('graphic', sel._id);
         const ch   = msg._forcedChar || (tok ? getObj('character', tok.get('represents')) : null);
@@ -726,25 +851,32 @@
         
         const useNpc = sheetNpc || hasNpcFields;
         
-        const EMPTY = { res:[], imm:[], abs:{}, vulnMap:{}, vulnList:[], threshold:0 };
+        const EMPTY = { res:[], imm:[], abs:[], vulnMap:[], vulnList:[], threshold:0 };
         const def = !ch ? EMPTY : (useNpc ? getNPCDefense(ch) : getPCDefense(ch));
 
         let total=0;
         const details=[openReport, openHdr + whoName + ': ' + _.escape(str) + closeHdr];
 
-        baseEntries.forEach(([raw,val],idx)=>{
-          let d=val; const low=normalizeType(raw);
-          details.push(`<b>${_.escape(raw)}</b> — базовый ${val}`);
-          if (def.imm.includes(low) || def.imm.includes('весь')) { details.push('Иммунитет → 0'); return; }
-          if (def.vulnMap[low]!=null){ d+=def.vulnMap[low]; details.push(`Слабость +${def.vulnMap[low]} → ${d}`); }
-          if (idx===maxIdx && def.vulnMap['весь']!=null){ d+=def.vulnMap['весь']; details.push(`Слабость (весь) +${def.vulnMap['весь']} → ${d}`); }
-          if (def.abs[low]!=null){ d-=def.abs[low]; details.push(`Поглощение ${low} -${def.abs[low]} → ${d}`); }
-          if (idx===maxIdx && def.abs['весь']!=null){ d-=def.abs['весь']; details.push(`Поглощение (весь) -${def.abs['весь']} → ${d}`); }
+        baseEntries.forEach((it)=>{
+          let d = it.amount;
+          const damageSpec = { type: it.type, flags: it.flags };
+          const flagText = it.flags.length ? ` [${it.flags.join(', ')}]` : '';
+          details.push(`<b>${_.escape(it.raw || it.type)}</b> (${it.type}${_.escape(flagText)}) — базовый ${it.amount}`);
+
+          const isImmune = def.imm.some(spec=>matchesDefenseSpec(damageSpec, spec));
+          if (isImmune) { details.push('Иммунитет → 0'); return; }
+
+          const weak = findTypedValue(def.vulnMap, damageSpec);
+          if (weak){ d += weak.value; details.push(`Слабость ${weak.type}${weak.flags?.length?' ['+weak.flags.join(', ')+']':''} +${weak.value} → ${d}`); }
+
+          const absorb = findTypedValue(def.abs, damageSpec);
+          if (absorb){ d -= absorb.value; details.push(`Поглощение ${absorb.type}${absorb.flags?.length?' ['+absorb.flags.join(', ')+']':''} -${absorb.value} → ${d}`); }
+
           if (d<1){ d=1; details.push('Минимум 1'); }
-          if (def.vulnList.includes(low) || def.vulnList.includes('весь')) { d*=2; details.push(`Уязвимость удвоение → ${d}`); }
-          if (def.res.includes(low) || def.res.includes('весь')) { d=Math.floor(d/2); details.push(`Сопротивление пополам → ${d}`); }
+          if (def.vulnList.some(spec=>matchesDefenseSpec(damageSpec, spec))) { d*=2; details.push('Уязвимость удвоение → ' + d); }
+          if (def.res.some(spec=>matchesDefenseSpec(damageSpec, spec))) { d=Math.floor(d/2); details.push('Сопротивление пополам → ' + d); }
           if (def.threshold>0 && d<def.threshold){ d=0; details.push(`Порог ${def.threshold} → 0`); }
-          total+=d; details.push(`Итог по ${_.escape(raw)}: ${d}`);
+          total+=d; details.push(`Итог по ${_.escape(it.raw || it.type)}: ${d}`);
         });
 
         details.push(`Всего урона (до ВХ): ${total}`);

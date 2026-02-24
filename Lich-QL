@@ -1,4 +1,3 @@
-// 0.52
 (() => {
   'use strict';
 
@@ -66,6 +65,8 @@
   state.DMS.LootOps          = state.DMS.LootOps          || {};   // совершённые операции (для отката)
   state.DMS.LootHistory      = state.DMS.LootHistory      || {}; // id → {charId,name,ts}
   state.DMS.LastLootGC       = state.DMS.LastLootGC       || 0;   // время последней уборки
+  state.DMS = state.DMS                                   || {};
+  state.DMS.PageSwitchTs     = state.DMS.PageSwitchTs     || 0;
 
   on('add:token', (tok) => { state.DMS.JustSpawned[tok.id] = Date.now(); });
 
@@ -111,7 +112,8 @@
     'чистая сила'          : /чист.*сил|force/,
     'электричество'        : /электр|молни|lightning/,
     'некротическая энергия': /некрот|necrotic/,
-    'яд'                   : /яд|poison/,
+    'яд-эриданы'           : /яд-эриданы/,
+    'яд'                   : /ядом|poison/,
     'психическая энергия'  : /психич|ментал|psychic/,
     'излучение'            : /излуч|radiant/,
     'звук'                 : /звук|звуков|thunder/,
@@ -132,6 +134,15 @@
     if (/\{\{\s*whisper\s*=\s*gm\s*\}\}/i.test(msg.content)) return true;
     return false;
   }
+  
+  const numOrNull = (v) => {
+      if (v === null || typeof v === 'undefined') return null;
+      // пропускаем только цифры и минус (на случай «—», пробелов, html и т.п.)
+      const s = String(v).replace(/[^0-9\-]/g, '').trim();
+      if (s === '' || s === '-' || s === '--') return null;
+      const n = Number(s);
+      return Number.isFinite(n) ? n : null;
+    };
 
   function guessCharacter(msg){
     const as = msg.speakingas || '';
@@ -316,6 +327,105 @@
     }
     return found;
   }
+  
+    // «к урону оружия» — не тип
+    const RE_ADD_TO_WEAPON = /\bк\s+урону\s+оружия\b/i;
+    
+    // Возвращает 'лечение' | 'временные хиты' | <тип урона> | null
+    function normalizeTypeSimple(rawName){
+        function resolveRName(s){
+          // убираем html, &nbsp; и лишние пробелы
+          return String(s||'')
+            .replace(/<br\s*\/?>/gi,' ')
+            .replace(/<[^>]*>/g,' ')
+            .replace(/&nbsp;/gi,' ')
+            .replace(/\s+/g,' ')
+            .trim();
+        }
+      const label = (resolveRName(rawName) || String(rawName) || '').trim();
+      if (!label) return null;
+      if (RE_ADD_TO_WEAPON.test(label)) return null;
+    
+      // приоритетно ловим хил и ВХ
+      if (/(леч(ени|ит)|healing|heal)/i.test(label)) return 'лечение';
+      if (/(времен.*хит|temp.*hp)/i.test(label))     return 'временные хиты';
+    
+      // затем — урон
+      const low = label.toLowerCase();
+      for (const [name, rx] of Object.entries(TYPE_MAP)) {
+        if (name === 'лечение' || name === 'временные хиты') continue;
+        if (rx.test(low)) return name;
+      }
+      return null;
+    }
+    
+    // SIMPLE: реагируем ТОЛЬКО на урон/лечение/ВХ
+    on('chat:message', (msg) => {
+      if (msg.rolltemplate !== 'simple' || !msg.content) return;
+    
+      const kv = {};
+      (msg.content.match(/{{[^}]+}}/g)||[]).forEach(chunk=>{
+        const m = chunk.match(/{{([^=]+)=(.+?)}}/);
+        if (m) kv[m[1].toLowerCase()] = m[2];
+      });
+    
+      const rawName = (kv['rname'] || '').trim();
+      if (!rawName) return;
+    
+      // Парсим число из r1
+      let amount = 0;
+      const r1 = String(kv['r1']||'');
+        // 1) сначала пробуем $[[i]]
+        let m = r1.match(/\$\[\[(\d+)]]/);
+        // 2) затем [[i]] на всякий
+        if (!m) m = r1.match(/\[\[(\d+)]]/);
+        
+        if (m) {
+          amount = rollTotal(m[1], msg);
+        } else {
+          // запасной вариант: если r1 это именно $[[0]], но регэксп по какой-то причине не поймал —
+          // берём первый инлайн-ролл целиком
+          if (Array.isArray(msg.inlinerolls) && msg.inlinerolls.length) {
+            amount = Number(msg.inlinerolls[0].results.total) || 0;
+          } else {
+            const mNum = r1.match(/-?\d+/);
+            if (mNum) amount = Number(mNum[0])||0;
+          }
+        }
+      const im = r1.match(/\[\[(\d+)]]/);
+      if (im) amount = rollTotal(im[1], msg);
+      else {
+        const mNum = r1.match(/-?\d+/);
+        if (mNum) amount = Number(mNum[0])||0;
+      }
+    
+      // Определяем тип. Если не распознали — выходим БЕЗ вывода.
+      const t = normalizeTypeSimple(rawName);
+      if (!t) return;
+    
+      // Рисуем только кнопки урона/лечения/ВХ
+      let bar = '';
+      if (t === 'лечение') {
+        if (amount) bar += btn('Лечение', cmd('heal', amount), `Исцелить на ${amount}`);
+      } else if (t === 'временные хиты') {
+        if (amount) bar += btn('Добавить временные хиты', cmd('temphp', amount), `Дать ${amount} ВХ`);
+      } else {
+        if (amount){
+          const s = `${amount} ${t}`;
+          bar += btn('Урон', cmd('deal', s), s);
+          const half = Math.floor(amount/2);
+          if (half) bar += btn('½ Урон', cmd('deal', `${half} ${t}`), 'Половина');
+        }
+      }
+    
+      if (!bar.includes('<a ')) return;
+      const wrap =
+        '<div style="border:1px solid #888;border-radius:6px;padding:4px;text-align:center;display:inline-block;background:#fafafa;'
+        + CSS_BUMP + '">' + bar + '</div>';
+    
+      if (isWhisperToGM(msg)) sendChat('', '/w gm '    + wrap, { noarchive:true });
+      else                    sendChat('', '/direct ' + wrap, { noarchive:true });
+    });
 
   // ── npcaction: извлечение «число + тип» рядом с инлайном
   function extractDamageTypes(msg, description){
@@ -608,9 +718,16 @@
 
         const controllers = (ch?.get('controlledby')||'').split(',').filter(Boolean);
         const isMob = !ch || controllers.length===0;
-
-        const EMPTY={res:[],imm:[],abs:{},vulnMap:{},vulnList:[],threshold:0};
-        const def = !ch ? EMPTY : (!controllers.length ? getNPCDefense(ch) : getPCDefense(ch));
+        
+        // Явное определение НПС по флагу листа и по наличию npc-полей
+        const sheetNpc = Number(getAttr(ch,'npc')) === 1; // dnd5e by Roll20: 1 для НПС
+        const hasNpcFields = ['npc_resistances','npc_immunities','npc_vulnerabilities','npc_damage_absorption']
+          .some(n => String(getAttr(ch, n)).trim() !== '');
+        
+        const useNpc = sheetNpc || hasNpcFields;
+        
+        const EMPTY = { res:[], imm:[], abs:{}, vulnMap:{}, vulnList:[], threshold:0 };
+        const def = !ch ? EMPTY : (useNpc ? getNPCDefense(ch) : getPCDefense(ch));
 
         let total=0;
         const details=[openReport, openHdr + whoName + ': ' + _.escape(str) + closeHdr];
@@ -966,6 +1083,60 @@
 
       delete state.DMS.LootOps[opId];
     }
+    
+    function parseModToken(tok){
+      // «+3», «-2», «3», «d4», «1d4», «+2d6», «к4/к6» (кириллица)
+      let s = String(tok||'').trim().toLowerCase().replace(/^к/,'d'); // к4 → d4
+      if (/^[+\-]?\d+$/.test(s)) return { type:'flat', n: Number(s) };
+      const m = s.match(/^([+\-])?(\d*)d(\d+)$/);
+      if (m){
+        const sign = (m[1]==='-') ? -1 : 1;
+        const cnt  = Math.max(1, Number(m[2]||1));
+        const die  = Math.max(2, Number(m[3]));
+        return { type:'dice', sign, cnt, die };
+      }
+      return { type:'bad' };
+    }
+    
+    function rollDiceSum(cnt, die){ // простенький роллер
+      let sum = 0;
+      for (let i=0;i<cnt;i++) sum += randomInteger(die);
+      return sum;
+    }
+    
+    function applyAddMod(payload, whoPid){
+      // payload: "<base>|<label>|<mod>"
+      const parts = String(payload||'').split('|');
+      if (parts.length < 3){ sendChat('DM-Scan', box('Неверный payload для addmod')); return; }
+    
+      const base   = Number(parts[0])||0;
+      const label  = parts[1];
+      const modStr = parts.slice(2).join('|').trim(); // вдруг был | в ?{…}
+    
+      const spec = parseModToken(modStr);
+      if (spec.type === 'bad'){
+        sendChat('DM-Scan', box('Модификатор должен быть числом или костью: +3, -2, d4, 2d6 и т.п.'));
+        return;
+      }
+    
+      let delta = 0, desc = '';
+      if (spec.type==='flat'){
+        delta = spec.n;
+        desc  = (delta>=0?'+':'') + delta;
+      } else {
+        const rolled = rollDiceSum(spec.cnt, spec.die);
+        delta = spec.sign * rolled;
+        desc  = `${spec.sign<0?'-':''}${spec.cnt}d${spec.die} → ${delta}`;
+      }
+    
+      const total = base + delta;
+    
+      // аккуратный отчёт всем: игроку (кто нажал) и ГМу
+      const summary = `Модификатор ${_.escape(desc)} → итог ${total}.`;
+      const htmlP   = summary; // или просто: const htmlP = summary;
+    
+      sendChat('', '/direct ' + htmlP, { noarchive:true });
+    }
 
     const handlers = {
       'deal'          : ()=>applyDealDamage(payload),
@@ -976,6 +1147,7 @@
       'undochar-temp' : ()=>undoTemp(payload),
       'loot'         : ()=>claimLoot(payload),
       'loot-undo'    : ()=>undoLoot(payload),
+      'addmod' : ()=>applyAddMod(payload, msg.playerid),
       'details'       : ()=>showDetails(payload, msg.playerid)
     };
     if (handlers[action]) handlers[action]();
@@ -1171,8 +1343,14 @@
   // ───────────────────────────────────────────────────────────────────────────
   // ЛОГИ И ОПОВЕЩЕНИЯ ОБ ИЗМЕНЕНИЯХ ХП/ВХ
   // ───────────────────────────────────────────────────────────────────────────
+  // Возвращает число или null, если не удалось корректно распарсить
+  
   function notifyHpChange(charId, token, newHp, oldHp, kind='hp'){
     if (!charId) return;
+    
+    // если хотя бы одно значение невалидно — не пишем сообщение
+    if (!Number.isFinite(newHp) || !Number.isFinite(oldHp)) return;
+     
     const key = charId + '|' + kind;
     const last = state.DMS.HPLock[key] || {};
     const now  = Date.now();
@@ -1197,29 +1375,40 @@
                  + closeReport;
       sendChat('', `/w gm ${html}`); // ← пустой спикер вместо 'DM-Scan'
     }
-
-  on('change:token:bar3_value', (tok, prev)=>{
-    if (!tok.get('represents')) return;
-    if (state.DMS.IgnoreBar3Update[tok.id]){ delete state.DMS.IgnoreBar3Update[tok.id]; return; }
-    const born = state.DMS.JustSpawned[tok.id];
-    if (born && Date.now()-born<1500){ delete state.DMS.JustSpawned[tok.id]; return; }
-    if (!prev.bar3_link && tok.get('bar3_link')) return;
-    if (prev.represents !== tok.get('represents')) return;
-
-    const oldV = Number(prev.bar3_value||0);
-    const newV = Number(tok.get('bar3_value')||0);
-    if (newV===oldV) return;
-    notifyHpChange(tok.get('represents'), tok, newV, oldV, 'hp');
-  });
-
-  on('change:attribute', (attr, prev)=>{
-    const name = attr.get('name'); if (name!=='hp' && name!=='hp_temp') return;
-    const charId = attr.get('characterid');
-    const oldV = Number(prev.current||0);
-    const newV = Number(attr.get('current')||0);
-    if (newV===oldV) return;
-    notifyHpChange(charId, null, newV, oldV, name);
-  });
+    on('change:campaign:playerpageid', ()=>{ state.DMS.PageSwitchTs = Date.now(); });
+    on('change:campaign:playerspecificpages', ()=>{ state.DMS.PageSwitchTs = Date.now(); }); // на всякий
+    
+    on('change:token:bar3_value', (tok, prev)=>{
+      // игнорируем всё, что не на активной странице игроков
+      if (tok.get('_pageid') !== Campaign().get('playerpageid')) return;
+    
+      // 1–2 секунды после переключения страницы — молчим
+      if (Date.now() - (state.DMS.PageSwitchTs||0) < 2000) return;
+      
+      if (!tok.get('represents')) return;
+      if (state.DMS.IgnoreBar3Update[tok.id]){ delete state.DMS.IgnoreBar3Update[tok.id]; return; }
+      const born = state.DMS.JustSpawned[tok.id];
+      if (born && Date.now()-born<1500){ delete state.DMS.JustSpawned[tok.id]; return; }
+      if (!prev.bar3_link && tok.get('bar3_link')) return;
+      if (prev.represents !== tok.get('represents')) return;
+    
+      const oldV = numOrNull(prev.bar3_value);
+      const newV = numOrNull(tok.get('bar3_value'));
+      if (oldV === null || newV === null || newV === oldV) return; // ← не пишем
+    
+      notifyHpChange(tok.get('represents'), tok, newV, oldV, 'hp');
+    });
+    
+    on('change:attribute', (attr, prev)=>{
+      const name = attr.get('name'); if (name!=='hp' && name!=='hp_temp') return;
+      const charId = attr.get('characterid');
+    
+      const oldV = numOrNull(prev.current);
+      const newV = numOrNull(attr.get('current'));
+      if (oldV === null || newV === null || newV === oldV) return; // ← не пишем
+    
+      notifyHpChange(charId, null, newV, oldV, name);
+    });
 
 })();  // конец IIFE
 

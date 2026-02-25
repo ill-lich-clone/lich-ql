@@ -899,11 +899,11 @@
         const isMob = !ch || controllers.length===0;
         
         // Явное определение НПС по флагу листа и по наличию npc-полей
-        const sheetNpc = Number(getAttr(ch,'npc')) === 1; // dnd5e by Roll20: 1 для НПС
-        const hasNpcFields = ['npc_resistances','npc_immunities','npc_vulnerabilities','npc_damage_absorption']
+        const sheetNpc = !!ch && Number(getAttr(ch,'npc')) === 1; // dnd5e by Roll20: 1 для НПС
+        const hasNpcFields = !!ch && ['npc_resistances','npc_immunities','npc_vulnerabilities','npc_damage_absorption']
           .some(n => String(getAttr(ch, n)).trim() !== '');
         
-        const useNpc = sheetNpc || hasNpcFields;
+        const useNpc = !!ch && (sheetNpc || hasNpcFields);
         
         const EMPTY = { res:[], imm:[], abs:[], vulnMap:[], vulnList:[], threshold:0 };
         const def = !ch ? EMPTY : (useNpc ? getNPCDefense(ch) : getPCDefense(ch));

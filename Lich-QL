@@ -189,20 +189,30 @@
     return findObjs({ _pageid:pageId, type:'graphic', subtype:'token', represents:char.id })[0] || null;
   }
 
+  function normalizeFlagToken(token){
+    const t = String(token||'').toLowerCase().replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim();
+    if (!t) return null;
+    if (/[={}]/.test(t) || /\[\[|]]/.test(t)) return null;   // шаблонные хвосты Roll20
+    if (t.length > 32) return null;
+    return t;
+  }
   function parseDamageSpec(raw){
     const src = String(raw||'').trim().toLowerCase();
     if (!src) return { type:'без_типа', flags:[] };
 
     const flags = new Set();
-    let base = src;
+    let base = src.replace(/\[\[[^\]]*]]/g, ' '); // inline placeholders Roll20
 
     base = base.replace(/\[([^\]]+)]|\(([^)]+)\)/g, (_, a, b)=>{
-      String(a||b||'').split(/[,;|]/).map(x=>x.trim()).filter(Boolean).forEach(f=>flags.add(f));
+      String(a||b||'').split(/[,;|]/).forEach(f=>{
+        const n = normalizeFlagToken(f);
+        if (n) flags.add(n);
+      });
       return ' ';
     });
 
-    base = base.replace(/\bнемагическ[а-яё]*\b/gi, (m)=>{ flags.add('немагический'); return ' '; });
-    base = base.replace(/\bмагическ[а-яё]*\b/gi, (m)=>{ flags.add('магический'); return ' '; });
+    base = base.replace(/\bнемагическ[а-яё]*\b/gi, ()=>{ flags.add('немагический'); return ' '; });
+    base = base.replace(/\bмагическ[а-яё]*\b/gi, ()=>{ flags.add('магический'); return ' '; });
 
     const type = normalizeType(base.replace(/\s+/g,' ').trim() || 'без_типа');
     return { type, flags:[...flags] };
@@ -216,6 +226,10 @@
     const type = normalizeType((m && m[1]) ? m[1] : key);
     const flags = (m && m[2]) ? m[2].split('|').map(x=>x.trim()).filter(Boolean) : [];
     return { type, flags };
+  }
+  function formatDamageSpec(spec){
+    const flags = (spec.flags||[]).filter(Boolean);
+    return flags.length ? `${spec.type} [${flags.join(', ')}]` : spec.type;
   }
   function parseDamageString(str){
     const out = [];
@@ -233,7 +247,7 @@
     Object.entries(totals).filter(([,n])=>n)
       .map(([key,n])=>{
         const spec = parseDamageKey(key);
-        const label = makeDamageKey(spec.type, spec.flags);
+        const label = formatDamageSpec(spec);
         return label==='без_типа'?`${n}`:`${n} ${label}`;
       })
       .join(' + ') || '0';
@@ -605,13 +619,16 @@
     if (!m) return [];
     const plain = m[1]
       .replace(/<br\s*\/?>/gi, ',')
+      .replace(/\[\[[^\]]*]]/g, ' ')
       .replace(/<[^>]*>/g, ' ')
       .toLowerCase();
     const flags = new Set();
     plain.split(/[,;\.]/).map(x=>x.trim()).filter(Boolean).forEach(tok=>{
-      if (/немагическ/.test(tok)) flags.add('немагический');
-      else if (/магическ/.test(tok)) flags.add('магический');
-      else if (tok.length <= 32) flags.add(tok);
+      if (/немагическ/.test(tok)) { flags.add('немагический'); return; }
+      if (/магическ/.test(tok)) { flags.add('магический'); return; }
+      if (/spelllevel|charname|global/.test(tok)) return;
+      const n = normalizeFlagToken(tok);
+      if (n) flags.add(n);
     });
     return [...flags];
   }
@@ -860,23 +877,23 @@
         baseEntries.forEach((it)=>{
           let d = it.amount;
           const damageSpec = { type: it.type, flags: it.flags };
-          const flagText = it.flags.length ? ` [${it.flags.join(', ')}]` : '';
-          details.push(`<b>${_.escape(it.raw || it.type)}</b> (${it.type}${_.escape(flagText)}) — базовый ${it.amount}`);
+          const label = formatDamageSpec(damageSpec);
+          details.push(`<b>${_.escape(label)}</b> — базовый ${it.amount}`);
 
           const isImmune = def.imm.some(spec=>matchesDefenseSpec(damageSpec, spec));
           if (isImmune) { details.push('Иммунитет → 0'); return; }
 
           const weak = findTypedValue(def.vulnMap, damageSpec);
-          if (weak){ d += weak.value; details.push(`Слабость ${weak.type}${weak.flags?.length?' ['+weak.flags.join(', ')+']':''} +${weak.value} → ${d}`); }
+          if (weak){ d += weak.value; details.push(`Слабость ${formatDamageSpec(weak)} +${weak.value} → ${d}`); }
 
           const absorb = findTypedValue(def.abs, damageSpec);
-          if (absorb){ d -= absorb.value; details.push(`Поглощение ${absorb.type}${absorb.flags?.length?' ['+absorb.flags.join(', ')+']':''} -${absorb.value} → ${d}`); }
+          if (absorb){ d -= absorb.value; details.push(`Поглощение ${formatDamageSpec(absorb)} -${absorb.value} → ${d}`); }
 
           if (d<1){ d=1; details.push('Минимум 1'); }
           if (def.vulnList.some(spec=>matchesDefenseSpec(damageSpec, spec))) { d*=2; details.push('Уязвимость удвоение → ' + d); }
           if (def.res.some(spec=>matchesDefenseSpec(damageSpec, spec))) { d=Math.floor(d/2); details.push('Сопротивление пополам → ' + d); }
           if (def.threshold>0 && d<def.threshold){ d=0; details.push(`Порог ${def.threshold} → 0`); }
-          total+=d; details.push(`Итог по ${_.escape(it.raw || it.type)}: ${d}`);
+          total+=d; details.push(`Итог по ${_.escape(label)}: ${d}`);
         });
 
         details.push(`Всего урона (до ВХ): ${total}`);

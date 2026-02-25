@@ -294,6 +294,7 @@
   function matchesDefenseSpec(damageSpec, defenseSpec){
     if (!defenseSpec) return false;
     if (!matchesDefenseType(damageSpec.type, defenseSpec.type)) return false;
+    if ((defenseSpec.excludeTypes||[]).includes(damageSpec.type)) return false;
     return hasAllFlags(defenseSpec.flags, damageSpec.flags);
   }
   function findTypedValue(entries, damageSpec){
@@ -326,8 +327,17 @@
     return out;
   }
   function parseDefenseSpec(raw){
+    const txt = String(raw||'').trim();
+    const wholeWithExclude = txt.match(/^(?:весь|все|любой)(?:\s*-\s*(.+))?$/i);
+    if (wholeWithExclude){
+      const excludes = String(wholeWithExclude[1]||'')
+        .split(/\s*-\s*/)
+        .map(x=>normalizeType(x.trim()))
+        .filter(Boolean);
+      return { type:'весь', flags:[], excludeTypes:[...new Set(excludes)] };
+    }
     const spec = parseDamageSpec(raw, { addImplicitNonmagical:false });
-    return { type: spec.type, flags: spec.flags };
+    return { type: spec.type, flags: spec.flags, excludeTypes:[] };
   }
   function parseDefenseList(s){
     return parseList(s).map(parseDefenseSpec);
@@ -424,9 +434,19 @@
           v  = getAttr(char,'npc_vulnerabilities'),
           th = Number(getAttr(char,'damage_threshold'))||0;
 
-    const res = parseDefenseList(r),
+    const resistText = String(r||'');
+    const firstDotIdx = resistText.indexOf('.');
+    const resistPart = firstDotIdx >= 0 ? resistText.slice(0, firstDotIdx) : resistText;
+    let absorbFromResist = [];
+    if (firstDotIdx >= 0){
+      const tail = resistText.slice(firstDotIdx + 1);
+      const mAbs = tail.match(/поглощени[ея]\s*:\s*([^\.]+)/i);
+      if (mAbs) absorbFromResist = parseDefenseMap(mAbs[1]);
+    }
+
+    const res = parseDefenseList(resistPart),
           imm = parseDefenseList(i),
-          abs = parseDefenseMap(a),
+          abs = parseDefenseMap(a).concat(absorbFromResist),
           vm  = parseDefenseMap(v),
           vmKeys = new Set(vm.map(x=>makeDamageKey(x.type, x.flags))),
           vl  = parseDefenseList(v).filter(x=>!vmKeys.has(makeDamageKey(x.type, x.flags)));
@@ -653,6 +673,7 @@
     (msg.content.match(/{{[^}]+}}/g)||[]).forEach(chunk=>{
       const m=chunk.match(/{{([^=]+)=(.+?)}}/); if (m) kv[m[1].toLowerCase()] = m[2];
     });
+    const isSpellTemplate = Object.prototype.hasOwnProperty.call(kv,'spelllevel');
     const w1=normalizeType((kv['dmg1type']||'без_типа').trim());
     const w2=normalizeType((kv['dmg2type']||'без_типа').trim());
     const commonFlags = extractDamageFlagsFromDescription(msg.content);
@@ -662,7 +683,8 @@
       if (!val) return;
       const resolved = resolveWeaponTypeAlias(rawType||'без_типа', w1, w2);
       const spec = parseDamageSpec(resolved, { addImplicitNonmagical:false });
-      const flags = normalizeDamageFlags(spec.flags.concat(commonFlags, extraFlags), { addImplicitNonmagical:true });
+      const spellFlags = isSpellTemplate ? ['магический'] : [];
+      const flags = normalizeDamageFlags(spec.flags.concat(commonFlags, extraFlags, spellFlags), { addImplicitNonmagical:true });
       const key = makeDamageKey(spec.type, flags);
       totals[key]=(totals[key]||0)+val;
     };
@@ -877,11 +899,11 @@
         const isMob = !ch || controllers.length===0;
         
         // Явное определение НПС по флагу листа и по наличию npc-полей
-        const sheetNpc = Number(getAttr(ch,'npc')) === 1; // dnd5e by Roll20: 1 для НПС
-        const hasNpcFields = ['npc_resistances','npc_immunities','npc_vulnerabilities','npc_damage_absorption']
+        const sheetNpc = !!ch && Number(getAttr(ch,'npc')) === 1; // dnd5e by Roll20: 1 для НПС
+        const hasNpcFields = !!ch && ['npc_resistances','npc_immunities','npc_vulnerabilities','npc_damage_absorption']
           .some(n => String(getAttr(ch, n)).trim() !== '');
         
-        const useNpc = sheetNpc || hasNpcFields;
+        const useNpc = !!ch && (sheetNpc || hasNpcFields);
         
         const EMPTY = { res:[], imm:[], abs:[], vulnMap:[], vulnList:[], threshold:0 };
         const def = !ch ? EMPTY : (useNpc ? getNPCDefense(ch) : getPCDefense(ch));

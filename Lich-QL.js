@@ -196,9 +196,23 @@
     if (t.length > 32) return null;
     return t;
   }
-  function parseDamageSpec(raw){
+  function normalizeDamageFlags(flags, opts){
+    const options = Object.assign({ addImplicitNonmagical:false }, opts||{});
+    const out = new Set();
+    (flags||[]).forEach(flag=>{
+      const n = normalizeFlagToken(flag);
+      if (n) out.add(n);
+    });
+    if (options.addImplicitNonmagical){
+      if (out.has('магический')) out.delete('немагический');
+      else out.add('немагический');
+    }
+    return [...out];
+  }
+  function parseDamageSpec(raw, opts){
+    const options = Object.assign({ addImplicitNonmagical:false }, opts||{});
     const src = String(raw||'').trim().toLowerCase();
-    if (!src) return { type:'без_типа', flags:[] };
+    if (!src) return { type:'без_типа', flags:normalizeDamageFlags([], options) };
 
     const flags = new Set();
     let base = src.replace(/\[\[[^\]]*]]/g, ' '); // inline placeholders Roll20
@@ -215,7 +229,7 @@
     base = base.replace(/\bмагическ[а-яё]*\b/gi, ()=>{ flags.add('магический'); return ' '; });
 
     const type = normalizeType(base.replace(/\s+/g,' ').trim() || 'без_типа');
-    return { type, flags:[...flags] };
+    return { type, flags:normalizeDamageFlags([...flags], options) };
   }
   function makeDamageKey(type, flags){
     const arr = [...new Set((flags||[]).map(f=>String(f).trim().toLowerCase()).filter(Boolean))].sort();
@@ -237,7 +251,7 @@
     while((m = re.exec(str)) !== null){
       const amount = Number(m[1]) || 0;
       if (!amount) continue;
-      const spec = parseDamageSpec(m[2]);
+      const spec = parseDamageSpec(m[2], { addImplicitNonmagical:true });
       out.push({ amount, type: spec.type, flags: spec.flags, raw: m[2].trim() });
     }
     return out;
@@ -312,7 +326,7 @@
     return out;
   }
   function parseDefenseSpec(raw){
-    const spec = parseDamageSpec(raw);
+    const spec = parseDamageSpec(raw, { addImplicitNonmagical:false });
     return { type: spec.type, flags: spec.flags };
   }
   function parseDefenseList(s){
@@ -647,8 +661,9 @@
     const add=(rawType,val,extraFlags=[])=>{
       if (!val) return;
       const resolved = resolveWeaponTypeAlias(rawType||'без_типа', w1, w2);
-      const spec = parseDamageSpec(resolved);
-      const key = makeDamageKey(spec.type, spec.flags.concat(commonFlags, extraFlags));
+      const spec = parseDamageSpec(resolved, { addImplicitNonmagical:false });
+      const flags = normalizeDamageFlags(spec.flags.concat(commonFlags, extraFlags), { addImplicitNonmagical:true });
+      const key = makeDamageKey(spec.type, flags);
       totals[key]=(totals[key]||0)+val;
     };
 
